@@ -1,0 +1,127 @@
+pipeline {
+    agent {label 'georgeJavaNode01'}
+    stages {
+        stage ('login ocp') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'msaocp', passwordVariable: 'password', usernameVariable: 'username')]){
+               sh '''
+                    oc login https://api.ocp49.redhat.poc:6443 -u $username -p $password
+                    oc project nanshan
+                '''
+              }
+            }
+        }
+        stage('clone from SCM') {
+            steps {
+                dir("/mprod") {
+                sh 'rm -rf /mprod/msa-test'
+                sh 'git clone git@github.com:palsys-poc/msa-test.git'
+                }
+            }
+			}
+        
+        stage('Create msa-test-git Application') { 
+            steps {
+               dir("/mprod/msa-test") {
+               sh './clean.sh  >/dev/null 2>&1'
+               sh 'oc new-app java:openjdk-11-el7~https://github.com/palsys-poc/msa-test.git --labels="app.kubernetes.io/part-of=msa-test-git-app,app=msa-test-git,version=v1" --name=msa-test-git -n nanshan'
+               }
+                }
+            }    
+
+        stage('Create product Application') { 
+            steps {
+               dir("/mprod/msa-test/product") {
+               sh './clean.sh  >/dev/null 2>&1'
+               sh 'oc new-app java:openjdk-11-el7~https://github.com/palsys-poc/msa-test-prod.git --labels="app.kubernetes.io/part-of=msa-test-git-app,app=product,version=v1" --name=product -n nanshan'
+               }
+                }
+            } 						
+			
+        stage('Create order Application') { 
+            steps {
+               dir("/mprod/msa-test/order") {
+               sh './clean.sh  >/dev/null 2>&1'
+               sh 'oc new-app java:openjdk-11-el7~https://github.com/palsys-poc/msa-test.git --context-dir=order --labels="app.kubernetes.io/part-of=msa-test-git-app,app=order,version=v1" --name=order -n nanshan'
+               }
+                }
+            }
+
+        stage('config msa-git-test service') { 
+            steps {
+               dir("/mprod/msa-test") {
+               sh '''
+                   oc delete svc msa-test-git
+                   oc apply -f ./svc.yaml
+                '''
+               }
+                }
+            }
+
+        stage('config product service') { 
+            steps {
+               dir("/mprod/msa-test/product") {
+               sh '''
+			       curl https://raw.githubusercontent.com/palsys-poc/msa-test-prod/v2/svc.yaml > svc.yaml
+                   oc delete svc product
+                   oc apply -f ./svc.yaml
+                '''
+               }
+                }
+            }
+        stage('deploy patch') { 
+            steps {
+               sh '''
+                   oc patch dc/postgres-database -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"true"}}}}}'
+                   oc patch deploy/msa-test-git -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"true"}}}}}'
+                   oc patch deploy/order -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"true"}}}}}'
+                   oc patch deploy/product -p '{"spec":{"template":{"metadata":{"annotations":{"sidecar.istio.io/inject":"true"}}}}}'
+                   oc set probe deployment product --readiness --get-url=http://:8080/products --period-seconds=3 --initial-delay-seconds=10
+                   oc set probe deployment msa-test-git --readiness --get-url=http://:8080/customers --period-seconds=3 --initial-delay-seconds=10
+                   oc set resources deployment product --limits=cpu=200m,memory=512Mi --requests=cpu=100m,memory=256Mi
+                   oc set resources deployment msa-test-git --limits=cpu=200m,memory=512Mi --requests=cpu=100m,memory=256Mi
+                '''
+                }
+            }
+			
+        stage('check image already build') { 
+            steps {
+               sh '''
+                   echo check image status
+				   oc get is
+				   sleep 7m
+				   echo all done.
+                '''
+                }
+            }
+			
+        stage ('login Quay') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'msaquay', passwordVariable: 'password', usernameVariable: 'username')]){
+               sh '''
+                    docker login https://quay.ocp49.redhat.poc -u $username -p $password
+                '''
+              }
+            }
+        }			
+					
+        stage('push image to quay') { 
+            steps {
+               sh 'docker login -u root -p $(oc whoami -t) default-route-openshift-image-registry.apps.ocp49.redhat.poc'
+			   sh 'docker pull default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/msa-test-git'
+			   sh 'docker pull default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/order'
+			   sh 'docker pull default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/product'
+			   sh 'docker tag default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/msa-test-git quay.ocp49.redhat.poc/quayadmin/msa-test-git'
+			   sh 'docker tag default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/order quay.ocp49.redhat.poc/quayadmin/order'
+			   sh 'docker tag default-route-openshift-image-registry.apps.ocp49.redhat.poc/nanshan/product quay.ocp49.redhat.poc/quayadmin/product'
+			   sh 'docker push quay.ocp49.redhat.poc/quayadmin/msa-test-git'
+			   sh 'docker push quay.ocp49.redhat.poc/quayadmin/order'
+			   sh 'docker push quay.ocp49.redhat.poc/quayadmin/product'
+			   sh 'echo all done'
+                }
+            }			
+			
+			
+			
+      }
+    }
